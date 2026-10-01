@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { discoverAgents, discoverAgentsAll, resolveAgentName } from "../../src/agents/agents.ts";
-import { CLAUDE_CODE_ADAPTER_ID, CLAUDE_CODE_ENV_ALLOWLIST, CLAUDE_CODE_WRITER_ADAPTER_ID, CLAUDE_CODE_WRITER_TOOLS, createClaudeCodeJsonlParser, resolveClaudeCodeLaunch } from "../../src/runs/shared/claude-code-adapter.ts";
+import { CLAUDE_CODE_ADAPTER_ID, CLAUDE_CODE_ENV_ALLOWLIST, CLAUDE_CODE_WRITER_ADAPTER_ID, CLAUDE_CODE_WRITER_TOOLS, createClaudeCodeJsonlParser, resolveClaudeCodeLaunch, resolveClaudeCodeOverrideArgs } from "../../src/runs/shared/claude-code-adapter.ts";
 import { externalCliReceiptMetadata, resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import { clearExternalCliPreflightCacheForTests } from "../../src/runs/shared/external-cli-preflight.ts";
 import { runExternalCli } from "../../src/runs/shared/external-cli-runner.ts";
@@ -230,6 +230,51 @@ describe("Claude Code adapter", () => {
 			if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 		}
+	});
+
+	it("builds --model and --effort tokens from an explicit Claude Code request", () => {
+		assert.equal(resolveClaudeCodeOverrideArgs({}), undefined);
+		assert.deepEqual(resolveClaudeCodeOverrideArgs({ model: "claude-opus-5.5" }), ["--model", "claude-opus-5.5"]);
+		assert.deepEqual(resolveClaudeCodeOverrideArgs({ model: " sonnet " }), ["--model", "sonnet"]);
+		assert.deepEqual(resolveClaudeCodeOverrideArgs({ thinking: "medium" }), ["--effort", "medium"]);
+		assert.deepEqual(resolveClaudeCodeOverrideArgs({ model: "haiku", thinking: "minimal" }), ["--model", "haiku", "--effort", "low"]);
+		// Pi's wider thinking scale collapses onto Claude Code's five-value effort scale.
+		assert.equal(resolveClaudeCodeOverrideArgs({ thinking: "off" }), undefined);
+		assert.deepEqual(resolveClaudeCodeOverrideArgs({ thinking: "xhigh" }), ["--effort", "xhigh"]);
+		assert.deepEqual(resolveClaudeCodeOverrideArgs({ thinking: "max" }), ["--effort", "max"]);
+	});
+
+	it("rejects a model or thinking value it cannot pass as its own argv element", () => {
+		assert.throws(() => resolveClaudeCodeOverrideArgs({ model: "" }), /Invalid Claude Code model/);
+		assert.throws(() => resolveClaudeCodeOverrideArgs({ model: "--dangerously-skip-permissions" }), /Invalid Claude Code model/);
+		assert.throws(() => resolveClaudeCodeOverrideArgs({ model: "opus --tools Bash" }), /Invalid Claude Code model/);
+		assert.throws(() => resolveClaudeCodeOverrideArgs({ thinking: "turbo" }), /Invalid thinking level/);
+		assert.throws(() => resolveClaudeCodeOverrideArgs({ thinking: "off; rm -rf /" }), /Invalid thinking level/);
+	});
+
+	it("appends an override after the fixed argv and keeps it out of preflight", () => {
+		const overrideArgs = resolveClaudeCodeOverrideArgs({ model: "claude-opus-5.5", thinking: "medium" });
+		const launch = resolveClaudeCodeLaunch({ adapter: CLAUDE_CODE_ADAPTER_ID, command: "claude", overrideArgs });
+		assert.deepEqual(launch.args.slice(-4), ["--model", "claude-opus-5.5", "--effort", "medium"]);
+		assert.deepEqual(launch.args.slice(0, 2), ["-p", "--input-format"]);
+		assert.equal(launch.args.includes("--no-chrome"), true);
+		assert.deepEqual(launch.preflight.versionArgs, ["--version"]);
+		assert.deepEqual(launch.preflight.helpArgs, ["--help"]);
+		const writer = resolveClaudeCodeLaunch({ adapter: CLAUDE_CODE_WRITER_ADAPTER_ID, command: "claude", overrideArgs });
+		assert.deepEqual(writer.args.slice(-4), ["--model", "claude-opus-5.5", "--effort", "medium"]);
+	});
+
+	it("accepts model and thinking frontmatter only on the Claude Code adapters", () => {
+		const dir = tempDir();
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "cc-pinned.md"), `---\nname: cc-pinned\ndescription: Pinned Claude\nmodel: claude-opus-5.5\nthinking: medium\nrunner:\n  type: external-cli\n  adapter: claude-code\n  command: claude\n---\nReview.\n`, "utf-8");
+		fs.writeFileSync(path.join(agentsDir, "ccx-pinned.md"), `---\nname: ccx-pinned\ndescription: Pinned Codex\nmodel: gpt-5\nrunner:\n  type: external-cli\n  adapter: codex-exec\n  command: codex\n---\nReview.\n`, "utf-8");
+		const discovered = discoverAgentsAll(dir);
+		assert.equal(discovered.project.find((candidate) => candidate.name === "cc-pinned")?.model, "claude-opus-5.5");
+		assert.equal(discovered.agentDiagnostics?.some((diagnostic) => diagnostic.name === "cc-pinned"), false);
+		assert.equal(discovered.project.some((candidate) => candidate.name === "ccx-pinned"), false);
+		assert.match(discovered.agentDiagnostics?.find((diagnostic) => diagnostic.name === "ccx-pinned")?.error ?? "", /declares unsupported Pi-only fields: model/);
 	});
 
 	it("rejects frontmatter argv that would widen the packaged adapter", () => {
