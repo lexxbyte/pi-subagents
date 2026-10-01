@@ -1,11 +1,17 @@
 import { parseExternalCliJsonlEvent, type ExternalCliParser, type ExternalCliParserProgress, type ExternalCliParserTerminal } from "./external-cli-runner.ts";
 import type { ExternalCliPreflightSpec } from "./external-cli-preflight.ts";
+import { THINKING_LEVELS, type ThinkingLevel } from "../../shared/model-info.ts";
 
 const MAX_EVENT_TYPE_LENGTH = 128;
 const MAX_ERROR_LENGTH = 4_096;
 
 export const CLAUDE_CODE_ADAPTER_ID = "claude-code" as const;
 export const CLAUDE_CODE_WRITER_ADAPTER_ID = "claude-code-writer" as const;
+
+/** True for the two code-owned adapters that launch the Claude Code CLI. */
+export function isClaudeCodeAdapterId(value: unknown): value is typeof CLAUDE_CODE_ADAPTER_ID | typeof CLAUDE_CODE_WRITER_ADAPTER_ID {
+	return value === CLAUDE_CODE_ADAPTER_ID || value === CLAUDE_CODE_WRITER_ADAPTER_ID;
+}
 export const CLAUDE_CODE_WRITER_TOOLS = "Read,Write,Edit,Glob,Grep" as const;
 export const CLAUDE_CODE_ENV_ALLOWLIST = [
 	"PATH",
@@ -41,6 +47,53 @@ export const CLAUDE_CODE_ENV_ALLOWLIST = [
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
 ] as const;
+
+/**
+ * Claude Code exposes a five-value `--effort` scale. Pi's thinking vocabulary is
+ * wider, so the extra levels collapse onto the nearest supported value and `off`
+ * means "pass no flag at all".
+ */
+const CLAUDE_CODE_EFFORT_BY_THINKING: Record<ThinkingLevel, string | undefined> = {
+	off: undefined,
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+/** Claude Code model ids: aliases, `claude-*` ids, and Bedrock/Vertex prefixes. */
+const CLAUDE_CODE_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
+
+/**
+ * Build the extra argv for an explicit model/thinking request on a code-owned
+ * Claude Code adapter. Returns undefined when neither was requested, so the CLI
+ * falls back to its own configured default.
+ *
+ * Values are validated here because this module owns the adapter's argv: every
+ * returned token is passed as its own argv element, and an unusable value is a
+ * rejected launch rather than a silently different model.
+ */
+export function resolveClaudeCodeOverrideArgs(input: { model?: string; thinking?: string }): string[] | undefined {
+	const args: string[] = [];
+	if (input.model !== undefined) {
+		const model = input.model.trim();
+		if (!CLAUDE_CODE_MODEL_PATTERN.test(model)) {
+			throw new Error(`Invalid Claude Code model ${JSON.stringify(input.model)}; expected an alias such as "opus" or a model id such as "claude-opus-5.5".`);
+		}
+		args.push("--model", model);
+	}
+	if (input.thinking !== undefined) {
+		const thinking = input.thinking.trim();
+		if (!(THINKING_LEVELS as readonly string[]).includes(thinking)) {
+			throw new Error(`Invalid thinking level ${JSON.stringify(input.thinking)}; expected one of ${THINKING_LEVELS.join(", ")}.`);
+		}
+		const effort = CLAUDE_CODE_EFFORT_BY_THINKING[thinking as ThinkingLevel];
+		if (effort) args.push("--effort", effort);
+	}
+	return args.length > 0 ? args : undefined;
+}
 
 function terminalError(event: Record<string, unknown>): string {
 	for (const value of [event.error, event.result]) {
@@ -82,6 +135,8 @@ export function resolveClaudeCodeLaunch(input: {
 	command: string;
 	/** Test-only executable prefix for a fake Claude Code process. */
 	commandPrefixArgs?: readonly string[];
+	/** Trailing argv for an explicit model/thinking request, built by resolveClaudeCodeOverrideArgs. */
+	overrideArgs?: readonly string[];
 }): {
 	command: string;
 	args: string[];
@@ -108,6 +163,9 @@ export function resolveClaudeCodeLaunch(input: {
 		"--no-session-persistence",
 		"--disable-slash-commands",
 		"--no-chrome",
+		// Session options go last: preflight builds versionArgs/helpArgs from `prefix`
+		// only, so these tokens never reach the --version/--help probes.
+		...(input.overrideArgs ?? []),
 	];
 	return {
 		command: input.command,
